@@ -15,6 +15,9 @@ local CFG = {
 }
 local CHAR_LOOKUP
 
+local function is_supported_mode(mode)
+  return mode == 'v' or mode == 'V' or mode == '\22'
+end
 
 local function get_normalized_pos_list(mode)
   local pos_list = fn.getregionpos(fn.getpos('v'), fn.getpos('.'), { type = mode, eol = true })
@@ -30,49 +33,50 @@ local function get_normalized_pos_list(mode)
   return pos_list
 end
 
-local function get_marks(pos_list)
-  local ff = vim.bo.fileformat
-  local nl_str = ff == 'unix' and '\n' or ff == 'mac' and '\r' or '\r\n'
 
-  local s_row = pos_list[1][1][2]
-  local e_row = pos_list[#pos_list][1][2]
+local function get_marks_co(pos_list)
+  return coroutine.create(function()
+    local ff = vim.bo.fileformat
+    local nl_str = ff == 'unix' and '\n' or ff == 'mac' and '\r' or '\r\n'
 
-  local text = api.nvim_buf_get_lines(0, s_row - 1, e_row, true)
+    local s_row = pos_list[1][1][2]
+    local e_row = pos_list[#pos_list][1][2]
 
-  for i = 1, #text do
-    text[i] = table.concat({ text[i], nl_str })
-  end
+    local text = api.nvim_buf_get_lines(0, s_row - 1, e_row, true)
 
-  local ws_marks = {}
-  local cur_row, line_text, line_len, match_char, start_idx, end_idx
-
-  for _, pos_pair in ipairs(pos_list) do
-    cur_row = pos_pair[1][2]
-    start_idx = pos_pair[1][3]
-    end_idx = pos_pair[2][3]
-
-    line_text = table.concat({ text[cur_row - s_row + 1], nl_str })
-    line_len = #line_text
-
-    if start_idx < line_len then
-      repeat
-        start_idx, _, match_char = string.find(line_text, "([ \t\r\n])", start_idx)
-
-        if start_idx and start_idx <= end_idx then
-          if ff == 'dos' and line_len == start_idx then
-            table.insert(ws_marks, { cur_row, 0, CHAR_LOOKUP[match_char], "eol" })
-          else
-            table.insert(ws_marks, { cur_row, start_idx, CHAR_LOOKUP[match_char], "overlay" })
-          end
-
-          start_idx = start_idx + 1
-        end
-      until start_idx == nil or start_idx > end_idx
+    for i = 1, #text do
+      text[i] = table.concat({ text[i], nl_str })
     end
-  end
 
-  return ws_marks
+    local cur_row, line_text, line_len, match_char, start_idx, end_idx
+
+    for _, pos_pair in ipairs(pos_list) do
+      cur_row = pos_pair[1][2]
+      start_idx = pos_pair[1][3]
+      end_idx = pos_pair[2][3]
+
+      line_text = table.concat({ text[cur_row - s_row + 1], nl_str })
+      line_len = #line_text
+
+      if start_idx < line_len then
+        repeat
+          start_idx, _, match_char = string.find(line_text, "([ \t\r\n])", start_idx)
+
+          if start_idx and start_idx <= end_idx then
+            if ff == 'dos' and line_len == start_idx then
+              coroutine.yield({ cur_row, 0, CHAR_LOOKUP[match_char], "eol" })
+            else
+              coroutine.yield({ cur_row, start_idx, CHAR_LOOKUP[match_char], "overlay" })
+            end
+
+            start_idx = start_idx + 1
+          end
+        until start_idx == nil or start_idx > end_idx
+      end
+    end
+  end)
 end
+
 
 local function apply_marks(mark_table)
   for _, mark_data in ipairs(mark_table) do
@@ -87,10 +91,10 @@ local clear_ws_hl = function()
   api.nvim_buf_clear_namespace(0, NS_ID, 0, -1)
 end
 
-local highlight_ws = function()
+local function highlight_ws()
   local cur_mode = fn.mode()
 
-  if cur_mode ~= 'v' and cur_mode ~= 'V' and cur_mode ~= '\22' then
+  if not is_supported_mode(cur_mode) then
     return
   end
 
@@ -98,9 +102,37 @@ local highlight_ws = function()
 
   local pos_list = get_normalized_pos_list(cur_mode)
 
-  local marks = get_marks(pos_list)
+  local co = get_marks_co(pos_list)
 
-  apply_marks(marks)
+  local function apply_async()
+    local marks = {}
+    local batch_size = 10
+
+    if not is_supported_mode(fn.mode()) then
+      clear_ws_hl()
+      return
+    end
+
+    for _ = 1, batch_size do
+      local ok, mark = coroutine.resume(co)
+      if not ok or not mark then
+        break
+      end
+      table.insert(marks, mark)
+    end
+
+    if #marks > 0 then
+      apply_marks(marks)
+
+      if is_supported_mode(fn.mode()) then
+        vim.schedule(apply_async)
+      else
+        clear_ws_hl()
+      end
+    end
+  end
+
+  vim.schedule(apply_async)
 end
 
 local function init_aucmds()
